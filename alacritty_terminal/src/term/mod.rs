@@ -993,13 +993,9 @@ impl<T> Term<T> {
         // Clear all related cells when overwriting a fullwidth cell.
         if cursor_cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
             // Remove wide char and spacer.
-            let wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
             let point = self.grid.cursor.point;
-            if wide && point.column < self.last_column() {
-                self.grid[point.line][point.column + 1].flags.remove(Flags::WIDE_CHAR_SPACER);
-            } else if point.column > 0 {
-                self.grid[point.line][point.column - 1].clear_wide();
-            }
+            self.clear_split_wide_char(point.line, point.column);
+            self.clear_split_wide_char(point.line, point.column + 1);
 
             // Remove leading spacers.
             if point.column <= 1 && point.line != self.topmost_line() {
@@ -1109,11 +1105,28 @@ impl<T: EventListener> Handler for Term<T> {
             self.wrapline();
         }
 
-        // If in insert mode, first shift cells to the right.
+        // Wrap a wide char that does not fit before insert mode shifts the row it lands in.
         let columns = self.columns();
+        if width == 2 && self.grid.cursor.point.column + 1 >= columns {
+            if self.mode.contains(TermMode::LINE_WRAP) {
+                // Insert placeholder before wide char if glyph does not fit in this row.
+                self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+                self.write_at_cursor(' ');
+                self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                self.wrapline();
+            } else {
+                // Prevent out of bounds crash when linewrapping is disabled.
+                self.grid.cursor.input_needs_wrap = true;
+                return;
+            }
+        }
+
+        // If in insert mode, first shift cells to the right.
         if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
             let line = self.grid.cursor.point.line;
             let col = self.grid.cursor.point.column;
+            self.clear_split_wide_char(line, col);
+            self.clear_split_wide_char(line, Column(columns - width));
             let row = &mut self.grid[line][..];
 
             for col in (col.0..(columns - width)).rev() {
@@ -1124,20 +1137,6 @@ impl<T: EventListener> Handler for Term<T> {
         if width == 1 {
             self.write_at_cursor(c);
         } else {
-            if self.grid.cursor.point.column + 1 >= columns {
-                if self.mode.contains(TermMode::LINE_WRAP) {
-                    // Insert placeholder before wide char if glyph does not fit in this row.
-                    self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.write_at_cursor(' ');
-                    self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.wrapline();
-                } else {
-                    // Prevent out of bounds crash when linewrapping is disabled.
-                    self.grid.cursor.input_needs_wrap = true;
-                    return;
-                }
-            }
-
             // Write full width glyph to current cursor cell.
             self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
             self.write_at_cursor(c);
@@ -2822,9 +2821,23 @@ mod tests {
             ("A单中BC\x1b[1;3H\x1b[2P", "A  BC"),
             ("A单中B\x1b[1;3H\x1b[2X\x1b[2P", "A  B"),
             ("ABCDEFGH单\x1b[1;1H\x1b[@", " ABCDEFGH"),
+            ("A单BC\x1b[1;3H\x1b[4hX", "A X BC"),
+            ("12345678单\x1b[1;1H\x1b[4hX", "X12345678"),
+            ("ABCDEFG单\x1b[1;1H\x1b[4h中", "中_ABCDEFG"),
         ] {
             assert_eq!(edit_wide_chars(bytes).0, expected, "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn insert_mode_shifts_the_row_a_wrapped_wide_char_lands_in() {
+        let size = TermSize::new(10, 2);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, "123456789\r\n中BC\x1b[1;10H\x1b[4h单".as_bytes());
+
+        let line: String = (0..10).map(|column| term.grid[Line(1)][Column(column)].c).collect();
+        assert_eq!(line.trim_end(), "单 中 BC");
     }
 
     #[test]
@@ -2835,6 +2848,7 @@ mod tests {
             ("A单BC\x1b[1;4H\x1b[P", "A单_C"),
             ("A单BC\x1b[1;2H\x1b[@", "A 单_BC"),
             ("ABCD单EF\x1b[1;9H\x1b[5P", "ABCD单_EF"),
+            ("A单BC\x1b[1;2H\x1b[4hX", "AX单_BC"),
         ] {
             assert_eq!(edit_wide_chars(bytes).0, expected, "{bytes:?}");
         }
@@ -2856,6 +2870,18 @@ mod tests {
         let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;3H\x1b[41m\x1b[P");
         assert_eq!(text, "A BC");
         assert_eq!(bgs[1], red);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;3H\x1b[4h\x1b[41mX");
+        assert_eq!(text, "A X BC");
+        assert_eq!(bgs[1..4], [red, red, red]);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;3H\x1b[42mX");
+        assert_eq!(text, "A XBC");
+        assert_eq!(bgs[1..3], [green, green]);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;2H\x1b[42mX");
+        assert_eq!(text, "AX BC");
+        assert_eq!(bgs[1..3], [green, green]);
     }
 
     #[test]
