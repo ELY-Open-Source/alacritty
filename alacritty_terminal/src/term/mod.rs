@@ -1017,6 +1017,26 @@ impl<T> Term<T> {
         cursor_cell.extra = extra;
     }
 
+    /// Clear both halves of the fullwidth cell an edit's edge at `column` splits.
+    ///
+    /// Like xterm, the cleared cells take the current background color.
+    #[inline]
+    fn clear_split_wide_char(&mut self, line: Line, column: Column) {
+        if column.0 == 0 || column.0 >= self.columns() {
+            return;
+        }
+
+        let bg = self.grid.cursor.template.bg;
+        let row = &mut self.grid[line];
+        if row[column].flags.contains(Flags::WIDE_CHAR_SPACER)
+            && row[column - 1].flags.contains(Flags::WIDE_CHAR)
+        {
+            row[column - 1] = bg.into();
+            row[column] = bg.into();
+            self.damage.damage_line(line.0 as usize, column.0 - 1, column.0);
+        }
+    }
+
     #[inline]
     fn damage_cursor(&mut self) {
         // The normal cursor coordinates are always in viewport.
@@ -1196,6 +1216,8 @@ impl<T: EventListener> Handler for Term<T> {
         let num_cells = self.columns() - destination;
 
         let line = cursor.point.line;
+        self.clear_split_wide_char(line, source);
+        self.clear_split_wide_char(line, Column(self.columns() - count));
         self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
 
         let row = &mut self.grid[line][..];
@@ -1527,6 +1549,8 @@ impl<T: EventListener> Handler for Term<T> {
         // Cleared cells have current background color set.
         let bg = self.grid.cursor.template.bg;
         let line = cursor.point.line;
+        self.clear_split_wide_char(line, start);
+        self.clear_split_wide_char(line, end);
         self.damage.damage_line(line.0 as usize, start.0, end.0);
         let row = &mut self.grid[line];
         for cell in &mut row[start..end] {
@@ -1539,15 +1563,17 @@ impl<T: EventListener> Handler for Term<T> {
         let columns = self.columns();
         let cursor = &self.grid.cursor;
         let bg = cursor.template.bg;
+        let start = cursor.point.column.0;
 
         // Ensure deleting within terminal bounds.
-        let count = cmp::min(count, columns);
+        let count = cmp::min(count, columns - start);
 
-        let start = cursor.point.column.0;
         let end = cmp::min(start + count, columns - 1);
         let num_cells = columns - end;
 
         let line = cursor.point.line;
+        self.clear_split_wide_char(line, Column(start));
+        self.clear_split_wide_char(line, Column(start + count));
         self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
         let row = &mut self.grid[line][..];
 
@@ -1646,6 +1672,8 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::LineClearMode::All => (Column(0), Column(self.columns())),
         };
 
+        self.clear_split_wide_char(point.line, left);
+        self.clear_split_wide_char(point.line, right);
         self.damage.damage_line(point.line.0 as usize, left.0, right.0 - 1);
 
         let row = &mut self.grid[point.line];
@@ -1765,6 +1793,7 @@ impl<T: EventListener> Handler for Term<T> {
 
                 // Clear up to the current column in the current line.
                 let end = cmp::min(cursor.column + 1, Column(self.columns()));
+                self.clear_split_wide_char(cursor.line, end);
                 for cell in &mut self.grid[cursor.line][..end] {
                     *cell = bg.into();
                 }
@@ -1774,6 +1803,7 @@ impl<T: EventListener> Handler for Term<T> {
             },
             ansi::ClearMode::Below => {
                 let cursor = self.grid.cursor.point;
+                self.clear_split_wide_char(cursor.line, cursor.column);
                 for cell in &mut self.grid[cursor.line][cursor.column..] {
                     *cell = bg.into();
                 }
@@ -2755,6 +2785,77 @@ mod tests {
         term.input('a');
 
         assert_eq!(term.grid()[cursor].c, '▒');
+    }
+
+    /// First line after `bytes` on a 10 column terminal, a spacer as `_`, and its backgrounds.
+    fn edit_wide_chars(bytes: &str) -> (String, Vec<Color>) {
+        let size = TermSize::new(10, 2);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, bytes.as_bytes());
+
+        let row = &term.grid[Line(0)];
+        let text: String = (0..10)
+            .map(|column| match &row[Column(column)] {
+                cell if cell.flags.contains(Flags::WIDE_CHAR_SPACER) => '_',
+                cell => cell.c,
+            })
+            .collect();
+        let bgs = (0..10).map(|column| row[Column(column)].bg).collect();
+        (text.trim_end().into(), bgs)
+    }
+
+    #[test]
+    fn edits_clear_the_wide_chars_they_split() {
+        // `单` takes the second and third cells, `中` the fourth and fifth.
+        for (bytes, expected) in [
+            ("A单BC\x1b[1;3H\x1b[X", "A  BC"),
+            ("A单BC\x1b[1;2H\x1b[X", "A  BC"),
+            ("A单BC\x1b[1;3H\x1b[K", "A"),
+            ("A单BC\x1b[1;2H\x1b[1K", "   BC"),
+            ("A单BC\x1b[1;3H\x1b[J", "A"),
+            ("A单BC\x1b[1;2H\x1b[1J", "   BC"),
+            ("A单BC\x1b[1;3H\x1b[P", "A BC"),
+            ("A单BC\x1b[1;2H\x1b[P", "A BC"),
+            ("A单BC\x1b[1;3H\x1b[@", "A   BC"),
+            ("A单中BC\x1b[1;3H\x1b[2X", "A    BC"),
+            ("A单中BC\x1b[1;3H\x1b[2P", "A  BC"),
+            ("A单中B\x1b[1;3H\x1b[2X\x1b[2P", "A  B"),
+            ("ABCDEFGH单\x1b[1;1H\x1b[@", " ABCDEFGH"),
+        ] {
+            assert_eq!(edit_wide_chars(bytes).0, expected, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn edits_keep_the_wide_chars_they_do_not_split() {
+        for (bytes, expected) in [
+            ("A单BC\x1b[1;4H\x1b[X", "A单_ C"),
+            ("A单BC\x1b[1;4H\x1b[K", "A单_"),
+            ("A单BC\x1b[1;4H\x1b[P", "A单_C"),
+            ("A单BC\x1b[1;2H\x1b[@", "A 单_BC"),
+            ("ABCD单EF\x1b[1;9H\x1b[5P", "ABCD单_EF"),
+        ] {
+            assert_eq!(edit_wide_chars(bytes).0, expected, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn split_wide_chars_clear_with_the_erase_background() {
+        let red = Color::Named(NamedColor::Red);
+        let green = Color::Named(NamedColor::Green);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;2H\x1b[42m\x1b[X");
+        assert_eq!(text, "A  BC");
+        assert_eq!(bgs[1..3], [green, green]);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;3H\x1b[41m\x1b[X\x1b[42mX");
+        assert_eq!(text, "A XBC");
+        assert_eq!(bgs[1..3], [red, green]);
+
+        let (text, bgs) = edit_wide_chars("A\x1b[44m单\x1b[0mBC\x1b[1;3H\x1b[41m\x1b[P");
+        assert_eq!(text, "A BC");
+        assert_eq!(bgs[1], red);
     }
 
     #[test]
