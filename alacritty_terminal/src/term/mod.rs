@@ -1013,9 +1013,7 @@ impl<T> Term<T> {
         cursor_cell.extra = extra;
     }
 
-    /// Clear both halves of the fullwidth cell an edit's edge at `column` splits.
-    ///
-    /// Like xterm, the cleared cells take the current background color.
+    /// Clear a fullwidth cell split at `column`, as xterm does.
     #[inline]
     fn clear_split_wide_char(&mut self, line: Line, column: Column) {
         if column.0 == 0 || column.0 >= self.columns() {
@@ -1105,7 +1103,7 @@ impl<T: EventListener> Handler for Term<T> {
             self.wrapline();
         }
 
-        // Wrap a wide char that does not fit before insert mode shifts the row it lands in.
+        // Wrap an unfitting wide char before insert mode shifts.
         let columns = self.columns();
         if width == 2 && self.grid.cursor.point.column + 1 >= columns {
             if self.mode.contains(TermMode::LINE_WRAP) {
@@ -2786,7 +2784,7 @@ mod tests {
         assert_eq!(term.grid()[cursor].c, '▒');
     }
 
-    /// First line after `bytes` on a 10 column terminal, a spacer as `_`, and its backgrounds.
+    /// The first line after `bytes`, spacers as `_`, with backgrounds.
     fn edit_wide_chars(bytes: &str) -> (String, Vec<Color>) {
         let size = TermSize::new(10, 2);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -2806,7 +2804,7 @@ mod tests {
 
     #[test]
     fn edits_clear_the_wide_chars_they_split() {
-        // `单` takes the second and third cells, `中` the fourth and fifth.
+        // `单` spans CUP columns 2-3, `中` columns 4-5.
         for (bytes, expected) in [
             ("A单BC\x1b[1;3H\x1b[X", "A  BC"),
             ("A单BC\x1b[1;2H\x1b[X", "A  BC"),
