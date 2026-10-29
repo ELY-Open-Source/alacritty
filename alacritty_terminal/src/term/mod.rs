@@ -343,64 +343,15 @@ pub trait Graphics: Send {
     /// A clear, a reset or a screen swap.
     fn changed(&mut self, change: Change);
 
-    /// A resize: `moved` maps old points to new, if kept.
-    fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, columns: usize, lines: usize);
+    /// The cells placements stand on, which a resize moves.
+    fn anchors(&self) -> Vec<Point>;
+
+    /// A resize: each anchor's new cell, in order, if kept.
+    fn resized(&mut self, moved: &[Option<Point>], columns: usize, lines: usize);
 }
 
-/// Each line's logical line, from the oldest, and text cells.
-struct Logical {
-    top: i32,
-    columns: usize,
-    rows: Vec<(i32, usize)>,
-    /// Logical lines through the last that holds text.
-    text: i32,
-}
-
-impl Logical {
-    fn of(grid: &Grid<Cell>, reflow: bool) -> Self {
-        let (top, columns) = (-(grid.history_size() as i32), grid.columns());
-        let last = Column(columns - 1);
-        let mut rows = Vec::new();
-        let mut index = 0i32;
-        for line in top..grid.screen_lines() as i32 {
-            let flags = grid[Line(line)][last].flags;
-            // A wide character's leading spacer holds no text.
-            let spacer = flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
-            rows.push((index, columns - usize::from(spacer)));
-            if !(reflow && flags.contains(Flags::WRAPLINE)) {
-                index += 1;
-            }
-        }
-        let lines = top..grid.screen_lines() as i32;
-        let texted = lines.rev().find(|&line| !grid[Line(line)].is_clear());
-        let text = texted.map_or(0, |line| rows[(line - top) as usize].0 + 1);
-        Self { top, columns, rows, text }
-    }
-
-    /// `point`'s logical line and its offset in text cells.
-    fn at(&self, point: Point) -> Option<(i32, usize)> {
-        let at = usize::try_from(point.line.0 - self.top).ok()?;
-        let index = self.rows.get(at)?.0;
-        let before = self.rows[..at].iter().rev().take_while(|row| row.0 == index);
-        Some((index, before.map(|row| row.1).sum::<usize>() + point.column.0))
-    }
-
-    /// The point `offset` text cells into `before`'s line `index`.
-    fn point(&self, before: &Logical, (index, mut offset): (i32, usize)) -> Option<Point> {
-        // A full history drops its oldest lines.
-        let index = index - (before.text - self.text);
-        let first = self.rows.partition_point(|row| row.0 < index);
-        let rows = self.rows[first..].iter().take_while(|row| row.0 == index).count();
-        for (row, &(_, cells)) in self.rows[first..first + rows].iter().enumerate() {
-            if offset < cells || row + 1 == rows {
-                let column = Column(cmp::min(offset, self.columns - 1));
-                return Some(Point::new(Line(self.top + (first + row) as i32), column));
-            }
-            offset -= cells;
-        }
-        None
-    }
-}
+/// The link marking an anchor's cell through a resize.
+const ANCHOR: &str = "\u{7f}graphics";
 
 /// What a graphics command answers, and where the cursor goes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -774,13 +725,13 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        let before = self.graphics.is_some().then(|| Logical::of(&self.grid, !is_alt));
+        // Marked cells carry anchors through the reflow, as text moves.
+        let anchors = self.graphics.as_ref().map_or_else(Vec::new, |graphics| graphics.anchors());
+        let marks = self.mark(&anchors);
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
-        if let (Some(graphics), Some(before)) = (self.graphics.as_mut(), before) {
-            // Points keep their logical line and their text cells.
-            let after = Logical::of(&self.grid, !is_alt);
-            let moved = |point| after.point(&before, before.at(point)?);
+        let moved = self.unmark(&anchors, marks);
+        if let Some(graphics) = self.graphics.as_mut() {
             graphics.resized(&moved, num_cols, num_lines);
         }
 
@@ -809,6 +760,63 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+    }
+
+    /// Marks anchors' cells and their rows' first; returns old links.
+    fn mark(&mut self, anchors: &[Point]) -> Vec<(Point, Option<cell::Hyperlink>)> {
+        let (top, bottom) = (-(self.history_size() as i32), self.screen_lines() as i32);
+        let mut marks: Vec<(Point, Option<cell::Hyperlink>)> = Vec::new();
+        for &anchor in anchors {
+            for point in [anchor, Point::new(anchor.line, Column(0))] {
+                let inside =
+                    (top..bottom).contains(&point.line.0) && point.column.0 < self.columns();
+                if !inside || marks.iter().any(|mark| mark.0 == point) {
+                    continue;
+                }
+                let cell = &mut self.grid[point];
+                marks.push((point, cell.hyperlink()));
+                cell.set_hyperlink(Some(cell::Hyperlink::new(
+                    Some(marks.len() - 1),
+                    ANCHOR.into(),
+                )));
+            }
+        }
+        marks
+    }
+
+    /// Clears the marks; each anchor's cell, else its row's, moved.
+    fn unmark(
+        &mut self,
+        anchors: &[Point],
+        marks: Vec<(Point, Option<cell::Hyperlink>)>,
+    ) -> Vec<Option<Point>> {
+        let mut found = vec![None; marks.len()];
+        if !marks.is_empty() {
+            for line in -(self.history_size() as i32)..self.screen_lines() as i32 {
+                for column in 0..self.columns() {
+                    let point = Point::new(Line(line), Column(column));
+                    let cell = &mut self.grid[point];
+                    let link = cell.hyperlink().filter(|link| link.uri() == ANCHOR);
+                    let Some(index) = link.and_then(|link| link.id().parse::<usize>().ok()) else {
+                        continue;
+                    };
+                    cell.set_hyperlink(marks[index].1.clone());
+                    found[index] = Some(point);
+                }
+            }
+        }
+        let at = |point| marks.iter().position(|mark| mark.0 == point).and_then(|i| found[i]);
+        let last = self.columns() - 1;
+        anchors
+            .iter()
+            .map(|&anchor| {
+                at(anchor).or_else(|| {
+                    let row = at(Point::new(anchor.line, Column(0)))?;
+                    let column = cmp::min(row.column.0 + anchor.column.0, last);
+                    Some(Point::new(row.line, Column(column)))
+                })
+            })
+            .collect()
     }
 
     /// Active terminal modes.
@@ -2715,7 +2723,11 @@ mod tests {
 
             fn changed(&mut self, _: Change) {}
 
-            fn resized(&mut self, _: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {}
+            fn anchors(&self) -> Vec<Point> {
+                Vec::new()
+            }
+
+            fn resized(&mut self, _: &[Option<Point>], _: usize, _: usize) {}
         }
         #[derive(Clone)]
         struct Replies(Arc<Mutex<Vec<String>>>);
@@ -2759,13 +2771,12 @@ mod tests {
                 self.0.lock().unwrap().push(format!("{change:?}"));
             }
 
-            fn resized(
-                &mut self,
-                moved: &dyn Fn(Point) -> Option<Point>,
-                columns: usize,
-                lines: usize,
-            ) {
-                let point = moved(Point::new(Line(4), Column(0)));
+            fn anchors(&self) -> Vec<Point> {
+                vec![Point::new(Line(4), Column(0))]
+            }
+
+            fn resized(&mut self, moved: &[Option<Point>], columns: usize, lines: usize) {
+                let point = moved[0];
                 self.0.lock().unwrap().push(format!("resized {columns}x{lines} {point:?}"));
             }
         }
@@ -2802,11 +2813,11 @@ mod tests {
     }
 
     #[test]
-    fn a_resized_point_follows_its_character_through_a_reflow() {
+    fn a_resized_anchor_follows_its_character() {
         use std::sync::Mutex;
 
-        type Moved = Arc<Mutex<Vec<Option<Point>>>>;
-        struct Map(Moved);
+        type Points = Arc<Mutex<Vec<Point>>>;
+        struct Map(Points);
         impl Graphics for Map {
             fn command(&mut self, _: &[u8], _: Point) -> Answer {
                 Answer::default()
@@ -2816,65 +2827,52 @@ mod tests {
 
             fn changed(&mut self, _: Change) {}
 
-            fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {
-                let mut points = self.0.lock().unwrap();
-                *points = points.iter().map(|point| moved(point.expect("kept"))).collect();
+            fn anchors(&self) -> Vec<Point> {
+                self.0.lock().unwrap().clone()
+            }
+
+            fn resized(&mut self, moved: &[Option<Point>], _: usize, _: usize) {
+                *self.0.lock().unwrap() = moved.iter().map(|point| point.expect("kept")).collect();
             }
         }
 
-        // A wide character that no longer fits leaves a spacer.
-        type Case = (&'static str, &'static [(i32, usize)], &'static str);
-        let cases: [Case; 2] =
-            [("abcdefghijklmn\r\nxyz", &[(0, 6), (2, 2)], "gz"), ("abcd\u{754c}X", &[(0, 6)], "X")];
-        for (text, points, chars) in cases {
+        let a36 = "a".repeat(36) + "X";
+        // Text, history, size, anchors, sizes after, what they hold.
+        type Case<'a> =
+            (&'a str, usize, (usize, usize), &'a [(i32, usize)], &'a [(usize, usize)], &'a str);
+        let cases: [Case<'_>; 5] = [
+            ("abcdefghijklmn\r\nxyz", 100, (10, 5), &[(0, 6), (2, 2)], &[(5, 5), (10, 5)], "gz"),
+            // A wide character that no longer fits leaves a spacer.
+            ("abcd\u{754c}X", 100, (10, 5), &[(0, 6)], &[(5, 5), (10, 5)], "X"),
+            (
+                "abcdefghi\r\njklmnopqr\r\nstuvwxyz0\r\n123456789\r\nX",
+                3,
+                (10, 3),
+                &[(2, 0), (1, 3)],
+                &[(5, 3)],
+                "X4",
+            ),
+            ("X\x1b[5;1HY\x1b[1;1H", 100, (10, 5), &[(0, 0)], &[(10, 3)], "X"),
+            (&a36, 3, (10, 5), &[(3, 6)], &[(5, 5)], "X"),
+        ];
+        for (text, history, (columns, lines), points, sizes, chars) in cases {
             let points =
-                points.iter().map(|&(line, column)| Some(Point::new(Line(line), Column(column))));
-            let moved = Moved::new(Mutex::new(points.collect()));
-            let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
-            term.set_graphics(Box::new(Map(Arc::clone(&moved))));
+                points.iter().map(|&(line, column)| Point::new(Line(line), Column(column)));
+            let kept = Points::new(Mutex::new(points.collect()));
+            let config = Config { scrolling_history: history, ..Config::default() };
+            let mut term = Term::new(config, &TermSize::new(columns, lines), VoidListener);
+            term.set_graphics(Box::new(Map(Arc::clone(&kept))));
             let mut parser: ansi::Processor = ansi::Processor::new();
             parser.advance(&mut term, text.as_bytes());
-            for size in [TermSize::new(5, 5), TermSize::new(10, 5)] {
-                term.resize(size);
-                let points: Vec<Point> = moved.lock().unwrap().iter().flatten().copied().collect();
+            for &(columns, lines) in sizes {
+                term.resize(TermSize::new(columns, lines));
+                let points = kept.lock().unwrap().clone();
                 let seen: String = points.iter().map(|point| term.grid()[*point].c).collect();
-                assert_eq!(seen, chars, "{text:?} {points:?}");
+                assert_eq!(seen, chars, "{text:?} at {columns}x{lines}: {points:?}");
+                let marked = points.iter().any(|point| term.grid()[*point].hyperlink().is_some());
+                assert!(!marked, "the marks are gone");
             }
         }
-    }
-
-    #[test]
-    fn a_resized_point_keeps_its_line_when_a_full_history_drops_lines() {
-        use std::sync::Mutex;
-
-        type Moved = Arc<Mutex<Vec<Point>>>;
-        struct Map(Moved);
-        impl Graphics for Map {
-            fn command(&mut self, _: &[u8], _: Point) -> Answer {
-                Answer::default()
-            }
-
-            fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
-
-            fn changed(&mut self, _: Change) {}
-
-            fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {
-                let mut points = self.0.lock().unwrap();
-                *points = points.iter().map(|point| moved(*point).expect("kept")).collect();
-            }
-        }
-
-        let points = vec![Point::new(Line(2), Column(0)), Point::new(Line(1), Column(3))];
-        let moved = Moved::new(Mutex::new(points));
-        let config = Config { scrolling_history: 3, ..Config::default() };
-        let mut term = Term::new(config, &TermSize::new(10, 3), VoidListener);
-        term.set_graphics(Box::new(Map(Arc::clone(&moved))));
-        let mut parser: ansi::Processor = ansi::Processor::new();
-        parser.advance(&mut term, b"abcdefghi\r\njklmnopqr\r\nstuvwxyz0\r\n123456789\r\nX");
-        term.resize(TermSize::new(5, 3));
-        let seen: String =
-            moved.lock().unwrap().iter().map(|point| term.grid()[*point].c).collect();
-        assert_eq!(seen, "X4");
     }
 
     #[test]
