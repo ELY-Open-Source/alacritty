@@ -340,8 +340,49 @@ pub trait Graphics: Send {
     /// Lines in `region` moved up by `lines`, down when negative.
     fn scrolled(&mut self, region: &Range<Line>, lines: i32, oldest: Line);
 
-    /// A clear, a reset, a screen swap or a resize.
+    /// A clear, a reset or a screen swap.
     fn changed(&mut self, change: Change);
+
+    /// A resize: `moved` maps old points to new, if kept.
+    fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, columns: usize, lines: usize);
+}
+
+/// Each line's logical line, from the cursor's, and row within.
+struct Logical {
+    top: i32,
+    rows: Vec<(i32, usize)>,
+}
+
+impl Logical {
+    fn of(grid: &Grid<Cell>, reflow: bool) -> Self {
+        let top = -(grid.history_size() as i32);
+        let last = Column(grid.columns() - 1);
+        let mut rows = Vec::new();
+        let (mut index, mut within) = (0i32, 0usize);
+        for line in top..grid.screen_lines() as i32 {
+            rows.push((index, within));
+            let wraps = reflow && grid[Line(line)][last].flags.contains(Flags::WRAPLINE);
+            (index, within) = if wraps { (index, within + 1) } else { (index + 1, 0) };
+        }
+        let cursor = rows[(grid.cursor.point.line.0 - top) as usize].0;
+        rows.iter_mut().for_each(|row| row.0 -= cursor);
+        Self { top, rows }
+    }
+
+    /// `point`'s logical line and its offset in it, in `columns`.
+    fn at(&self, point: Point, columns: usize) -> Option<(i32, usize)> {
+        let (index, within) = *self.rows.get(usize::try_from(point.line.0 - self.top).ok()?)?;
+        Some((index, within * columns + point.column.0))
+    }
+
+    /// The point `offset` into logical line `index`, in `columns`.
+    fn point(&self, (index, offset): (i32, usize), columns: usize) -> Option<Point> {
+        let first = self.rows.partition_point(|row| row.0 < index);
+        let rows = self.rows[first..].iter().take_while(|row| row.0 == index).count();
+        let row = cmp::min(offset / columns, rows.checked_sub(1)?);
+        let column = cmp::min(offset - row * columns, columns - 1);
+        Some(Point::new(Line(self.top + (first + row) as i32), Column(column)))
+    }
 }
 
 /// What a graphics command answers, and where the cursor goes.
@@ -363,8 +404,6 @@ pub enum Change {
     Reset,
     /// The alternate screen is entered, or left.
     Alt(bool),
-    /// Lines moved by `lines`, as the vi cursor moves.
-    Resized { lines: i32, columns: usize, screen_lines: usize },
 }
 
 /// Configuration options for the [`Term`].
@@ -718,12 +757,15 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        if let Some(graphics) = self.graphics.as_mut() {
-            let (lines, columns, screen_lines) = (delta, num_cols, num_lines);
-            graphics.changed(Change::Resized { lines, columns, screen_lines });
-        }
+        let before = self.graphics.is_some().then(|| Logical::of(&self.grid, !is_alt));
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if let (Some(graphics), Some(before)) = (self.graphics.as_mut(), before) {
+            // Points follow their logical line, as the cursor does.
+            let after = Logical::of(&self.grid, !is_alt);
+            let moved = |point| after.point(before.at(point, old_cols)?, num_cols);
+            graphics.resized(&moved, num_cols, num_lines);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -2655,6 +2697,8 @@ mod tests {
             fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
 
             fn changed(&mut self, _: Change) {}
+
+            fn resized(&mut self, _: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {}
         }
         #[derive(Clone)]
         struct Replies(Arc<Mutex<Vec<String>>>);
@@ -2697,6 +2741,16 @@ mod tests {
             fn changed(&mut self, change: Change) {
                 self.0.lock().unwrap().push(format!("{change:?}"));
             }
+
+            fn resized(
+                &mut self,
+                moved: &dyn Fn(Point) -> Option<Point>,
+                columns: usize,
+                lines: usize,
+            ) {
+                let point = moved(Point::new(Line(4), Column(0)));
+                self.0.lock().unwrap().push(format!("resized {columns}x{lines} {point:?}"));
+            }
         }
 
         let heard = Heard::default();
@@ -2719,7 +2773,7 @@ mod tests {
                 "scroll Line(0)..Line(5) 1 -2",
                 "scroll Line(1)..Line(4) 1 -2",
                 "scroll Line(0)..Line(5) -1 -2",
-                "Resized { lines: -2, columns: 10, screen_lines: 3 }",
+                "resized 10x3 Some(Point { line: Line(2), column: Column(0) })",
                 "Screen",
                 "scroll Line(0)..Line(3) 1 -5",
                 "History",
@@ -2728,6 +2782,41 @@ mod tests {
                 "Reset",
             ]
         );
+    }
+
+    #[test]
+    fn a_resized_point_follows_its_character_through_a_reflow() {
+        use std::sync::Mutex;
+
+        type Moved = Arc<Mutex<Vec<Option<Point>>>>;
+        struct Map(Moved);
+        impl Graphics for Map {
+            fn command(&mut self, _: &[u8], _: Point) -> Answer {
+                Answer::default()
+            }
+
+            fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
+
+            fn changed(&mut self, _: Change) {}
+
+            fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {
+                let mut points = self.0.lock().unwrap();
+                *points = points.iter().map(|point| moved(point.expect("kept"))).collect();
+            }
+        }
+
+        let points = [Point::new(Line(0), Column(6)), Point::new(Line(2), Column(2))];
+        let moved = Moved::new(Mutex::new(points.map(Some).to_vec()));
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
+        term.set_graphics(Box::new(Map(Arc::clone(&moved))));
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"abcdefghijklmn\r\nxyz");
+        for size in [TermSize::new(5, 5), TermSize::new(10, 5)] {
+            term.resize(size);
+            let points: Vec<Point> = moved.lock().unwrap().iter().flatten().copied().collect();
+            let chars: String = points.iter().map(|point| term.grid()[*point].c).collect();
+            assert_eq!(chars, "gz", "{points:?}");
+        }
     }
 
     #[test]
