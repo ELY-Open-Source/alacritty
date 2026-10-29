@@ -1,12 +1,12 @@
 use std::cmp::max;
 use std::mem;
-use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use super::Row;
+use super::slot::{Packer, Slot};
 use crate::index::Line;
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
@@ -31,7 +31,7 @@ const MAX_CACHE_SIZE: usize = 1_000;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Storage<T> {
-    inner: Vec<Row<T>>,
+    inner: Vec<Slot<T>>,
 
     /// Starting point for the storage of rows.
     ///
@@ -70,7 +70,7 @@ impl<T> Storage<T> {
     {
         // Initialize visible lines; the scrollback buffer is initialized dynamically.
         let mut inner = Vec::with_capacity(visible_lines);
-        inner.resize_with(visible_lines, || Row::new(columns));
+        inner.resize_with(visible_lines, || Row::new(columns).into());
 
         Storage { inner, zero: 0, visible_lines, len: visible_lines }
     }
@@ -131,7 +131,7 @@ impl<T> Storage<T> {
             self.rezero();
 
             let realloc_size = self.inner.len() + max(additional_rows, MAX_CACHE_SIZE);
-            self.inner.resize_with(realloc_size, || Row::new(columns));
+            self.inner.resize_with(realloc_size, || Row::new(columns).into());
         }
 
         self.len += additional_rows;
@@ -142,37 +142,11 @@ impl<T> Storage<T> {
         self.len
     }
 
-    /// Swap implementation for Row<T>.
-    ///
-    /// Exploits the known size of Row<T> to produce a slightly more efficient
-    /// swap than going through slice::swap.
-    ///
-    /// The default implementation from swap generates 8 movups and 4 movaps
-    /// instructions. This implementation achieves the swap in only 8 movups
-    /// instructions.
+    /// Swap two lines' rows, packed or not.
     pub fn swap(&mut self, a: Line, b: Line) {
-        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 4);
-
         let a = self.compute_index(a);
         let b = self.compute_index(b);
-
-        unsafe {
-            // Cast to a qword array to opt out of copy restrictions and avoid
-            // drop hazards. Byte array is no good here since for whatever
-            // reason LLVM won't optimized it.
-            let a_ptr = self.inner.as_mut_ptr().add(a) as *mut MaybeUninit<usize>;
-            let b_ptr = self.inner.as_mut_ptr().add(b) as *mut MaybeUninit<usize>;
-
-            // Copy 1 qword at a time.
-            //
-            // The optimizer unrolls this loop and vectorizes it.
-            let mut tmp: MaybeUninit<usize>;
-            for i in 0..4 {
-                tmp = *a_ptr.offset(i);
-                *a_ptr.offset(i) = *b_ptr.offset(i);
-                *b_ptr.offset(i) = tmp;
-            }
-        }
+        self.inner.swap(a, b);
     }
 
     /// Rotate the grid, moving all lines up/down in history.
@@ -198,7 +172,7 @@ impl<T> Storage<T> {
     #[inline]
     pub fn replace_inner(&mut self, vec: Vec<Row<T>>) {
         self.len = vec.len();
-        self.inner = vec;
+        self.inner = vec.into_iter().map(Slot::Row).collect();
         self.zero = 0;
     }
 
@@ -212,7 +186,15 @@ impl<T> Storage<T> {
         mem::swap(&mut buffer, &mut self.inner);
         self.len = 0;
 
-        buffer
+        buffer.into_iter().map(Slot::into_row).collect()
+    }
+
+    /// Pack `lines`, which are idle history, or drop their unpacked copies.
+    pub fn compact(&mut self, lines: std::ops::Range<Line>, packer: Packer<T>) {
+        for line in lines.start.0..lines.end.0 {
+            let index = self.compute_index(Line(line));
+            self.inner[index].pack(packer);
+        }
     }
 
     /// Compute actual index in underlying storage given the requested index.
@@ -251,7 +233,7 @@ impl<T> Index<Line> for Storage<T> {
     #[inline]
     fn index(&self, index: Line) -> &Self::Output {
         let index = self.compute_index(index);
-        &self.inner[index]
+        self.inner[index].row()
     }
 }
 
@@ -259,7 +241,7 @@ impl<T> IndexMut<Line> for Storage<T> {
     #[inline]
     fn index_mut(&mut self, index: Line) -> &mut Self::Output {
         let index = self.compute_index(index);
-        &mut self.inner[index]
+        self.inner[index].row_mut()
     }
 }
 
@@ -267,9 +249,14 @@ impl<T> IndexMut<Line> for Storage<T> {
 mod tests {
     use crate::grid::GridCell;
     use crate::grid::row::Row;
+    use crate::grid::slot::Slot;
     use crate::grid::storage::{MAX_CACHE_SIZE, Storage};
     use crate::index::{Column, Line};
     use crate::term::cell::Flags;
+
+    fn slots(rows: Vec<Row<char>>) -> Vec<Slot<char>> {
+        rows.into_iter().map(Slot::Row).collect()
+    }
 
     impl GridCell for char {
         fn is_empty(&self) -> bool {
@@ -350,7 +337,7 @@ mod tests {
     fn grow_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
+            inner: slots(vec![filled_row('0'), filled_row('1'), filled_row('-')]),
             zero: 0,
             visible_lines: 3,
             len: 3,
@@ -361,12 +348,12 @@ mod tests {
 
         // Make sure the result is correct.
         let mut expected = Storage {
-            inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
+            inner: slots(vec![filled_row('0'), filled_row('1'), filled_row('-')]),
             zero: 0,
             visible_lines: 4,
             len: 4,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        expected.inner.append(&mut slots(vec![filled_row('\0'); MAX_CACHE_SIZE]));
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -391,7 +378,7 @@ mod tests {
     fn grow_before_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('-'), filled_row('0'), filled_row('1')],
+            inner: slots(vec![filled_row('-'), filled_row('0'), filled_row('1')]),
             zero: 1,
             visible_lines: 3,
             len: 3,
@@ -402,12 +389,12 @@ mod tests {
 
         // Make sure the result is correct.
         let mut expected = Storage {
-            inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
+            inner: slots(vec![filled_row('0'), filled_row('1'), filled_row('-')]),
             zero: 0,
             visible_lines: 4,
             len: 4,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        expected.inner.append(&mut slots(vec![filled_row('\0'); MAX_CACHE_SIZE]));
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -429,7 +416,7 @@ mod tests {
     fn shrink_before_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('2'), filled_row('0'), filled_row('1')],
+            inner: slots(vec![filled_row('2'), filled_row('0'), filled_row('1')]),
             zero: 1,
             visible_lines: 3,
             len: 3,
@@ -440,7 +427,7 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
-            inner: vec![filled_row('2'), filled_row('0'), filled_row('1')],
+            inner: slots(vec![filled_row('2'), filled_row('0'), filled_row('1')]),
             zero: 1,
             visible_lines: 2,
             len: 2,
@@ -465,7 +452,7 @@ mod tests {
     fn shrink_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('0'), filled_row('1'), filled_row('2')],
+            inner: slots(vec![filled_row('0'), filled_row('1'), filled_row('2')]),
             zero: 0,
             visible_lines: 3,
             len: 3,
@@ -476,7 +463,7 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
-            inner: vec![filled_row('0'), filled_row('1'), filled_row('2')],
+            inner: slots(vec![filled_row('0'), filled_row('1'), filled_row('2')]),
             zero: 0,
             visible_lines: 2,
             len: 2,
@@ -507,14 +494,14 @@ mod tests {
     fn shrink_before_and_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 6,
             len: 6,
@@ -525,14 +512,14 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 2,
             len: 2,
@@ -559,14 +546,14 @@ mod tests {
     fn truncate_invisible_lines() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 1,
             len: 2,
@@ -577,7 +564,7 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
-            inner: vec![filled_row('0'), filled_row('1')],
+            inner: slots(vec![filled_row('0'), filled_row('1')]),
             zero: 0,
             visible_lines: 1,
             len: 2,
@@ -601,7 +588,7 @@ mod tests {
     fn truncate_invisible_lines_beginning() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('1'), filled_row('2'), filled_row('0')],
+            inner: slots(vec![filled_row('1'), filled_row('2'), filled_row('0')]),
             zero: 2,
             visible_lines: 1,
             len: 2,
@@ -612,7 +599,7 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
-            inner: vec![filled_row('0'), filled_row('1')],
+            inner: slots(vec![filled_row('0'), filled_row('1')]),
             zero: 0,
             visible_lines: 1,
             len: 2,
@@ -651,14 +638,14 @@ mod tests {
     fn shrink_then_grow() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 0,
             len: 6,
@@ -669,14 +656,14 @@ mod tests {
 
         // Make sure the result after shrinking is correct.
         let shrinking_expected = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 0,
             len: 3,
@@ -690,14 +677,14 @@ mod tests {
 
         // Make sure the previously freed elements are reused.
         let growing_expected = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 0,
             len: 4,
@@ -712,14 +699,14 @@ mod tests {
     fn initialize() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
-            inner: vec![
+            inner: slots(vec![
                 filled_row('4'),
                 filled_row('5'),
                 filled_row('0'),
                 filled_row('1'),
                 filled_row('2'),
                 filled_row('3'),
-            ],
+            ]),
             zero: 2,
             visible_lines: 0,
             len: 6,
@@ -740,7 +727,8 @@ mod tests {
         ];
         let expected_init_size = std::cmp::max(init_size, MAX_CACHE_SIZE);
         expected_inner.append(&mut vec![filled_row('\0'); expected_init_size]);
-        let expected_storage = Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9 };
+        let expected_storage =
+            Storage { inner: slots(expected_inner), zero: 0, visible_lines: 0, len: 9 };
 
         assert_eq!(storage.len, expected_storage.len);
         assert_eq!(storage.zero, expected_storage.zero);
@@ -750,7 +738,7 @@ mod tests {
     #[test]
     fn rotate_wrap_zero() {
         let mut storage: Storage<char> = Storage {
-            inner: vec![filled_row('-'), filled_row('-'), filled_row('-')],
+            inner: slots(vec![filled_row('-'), filled_row('-'), filled_row('-')]),
             zero: 2,
             visible_lines: 0,
             len: 3,

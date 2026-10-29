@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+mod pack;
 pub mod search;
 
 /// Minimum number of columns.
@@ -438,6 +439,12 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Pack idle history in both screens' grids; reading it unpacks it again.
+    pub fn compact(&mut self) {
+        self.grid.compact(pack::pack);
+        self.inactive_grid.compact(pack::pack);
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where

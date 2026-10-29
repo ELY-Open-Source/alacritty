@@ -12,11 +12,13 @@ use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
 pub mod resize;
 mod row;
+mod slot;
 mod storage;
 #[cfg(test)]
 mod tests;
 
 pub use self::row::Row;
+pub use self::slot::{PackedRow, Packer};
 use self::storage::Storage;
 
 pub trait GridCell: Sized {
@@ -433,6 +435,16 @@ impl<T> Grid<T> {
     #[inline]
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    /// Pack the history more than a screen above the view, while idle.
+    pub fn compact(&mut self, packer: Packer<T>) {
+        let screen = self.screen_lines() as i32;
+        let keep = Line(-(self.display_offset as i32) - screen);
+        let top = self.topmost_line();
+        if top < keep {
+            self.raw.compact(top..keep, packer);
+        }
     }
 
     #[inline]
