@@ -50,6 +50,9 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
 
+/// kitty's paste events mode, which vte names no mode.
+const PASTE_EVENTS: u16 = 5522;
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TermMode: u32 {
@@ -77,6 +80,8 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// Mode 5522: a paste lists its MIME types to the program.
+        const PASTE_EVENTS            = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -2123,6 +2128,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(PASTE_EVENTS) => {
+                self.mode.insert(TermMode::PASTE_EVENTS);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2186,6 +2195,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(PASTE_EVENTS) => {
+                self.mode.remove(TermMode::PASTE_EVENTS);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2273,6 +2286,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            PrivateMode::Unknown(PASTE_EVENTS) => self.mode.contains(TermMode::PASTE_EVENTS).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2750,6 +2764,32 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [(b"i=1,a=q;AAAA".to_vec(), cursor)]);
         assert_eq!(*replies.lock().unwrap(), ["\x1b_Gi=1;OK\x1b\\"]);
         assert_eq!(term.grid()[cursor].c, 'd');
+    }
+
+    #[test]
+    fn paste_events_mode_is_kept_reported_and_reset() {
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Replies(Arc<Mutex<Vec<String>>>);
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+
+        let replies = Arc::default();
+        let mut term =
+            Term::new(Config::default(), &TermSize::new(10, 5), Replies(Arc::clone(&replies)));
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[?5522$p\x1b[?5522h\x1b[?5522$p");
+        assert!(term.mode().contains(TermMode::PASTE_EVENTS));
+        parser.advance(&mut term, b"\x1b[?5522l\x1b[?5522$p\x1b[?5522h\x1bc");
+        assert!(!term.mode().contains(TermMode::PASTE_EVENTS));
+        let replies = replies.lock().unwrap();
+        assert_eq!(*replies, ["\x1b[?5522;2$y", "\x1b[?5522;1$y", "\x1b[?5522;2$y"]);
     }
 
     #[test]
