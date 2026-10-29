@@ -327,6 +327,15 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Kitty graphics commands' handler, if any.
+    graphics: Option<Box<dyn Graphics>>,
+}
+
+/// Kitty graphics commands, handled by the embedder at the cursor.
+pub trait Graphics: Send {
+    /// One command's text after its `G`; returns its reply.
+    fn command(&mut self, command: &[u8], cursor: Point) -> Option<String>;
 }
 
 /// Configuration options for the [`Term`].
@@ -441,7 +450,13 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            graphics: None,
         }
+    }
+
+    /// Hands every kitty graphics command to `graphics`.
+    pub fn set_graphics(&mut self, graphics: Box<dyn Graphics>) {
+        self.graphics = Some(graphics);
     }
 
     /// Collect the information about the changes in the lines, which
@@ -1898,6 +1913,18 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn apc(&mut self, data: &[u8]) {
+        let (Some(command), Some(graphics)) = (data.strip_prefix(b"G"), self.graphics.as_mut())
+        else {
+            debug!("[unhandled apc] {:?}", String::from_utf8_lossy(&data[..data.len().min(64)]));
+            return;
+        };
+        if let Some(reply) = graphics.command(command, self.grid.cursor.point) {
+            self.event_proxy.send_event(Event::PtyWrite(reply));
+        }
+    }
+
+    #[inline]
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         trace!("Setting hyperlink: {hyperlink:?}");
         self.grid.cursor.template.set_hyperlink(hyperlink.map(|e| e.into()));
@@ -2544,6 +2571,40 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn kitty_graphics_reach_their_handler_at_the_cursor() {
+        use std::sync::Mutex;
+
+        struct Seen(Arc<Mutex<Vec<(Vec<u8>, Point)>>>);
+        impl Graphics for Seen {
+            fn command(&mut self, command: &[u8], cursor: Point) -> Option<String> {
+                self.0.lock().unwrap().push((command.to_vec(), cursor));
+                Some("\x1b_Gi=1;OK\x1b\\".into())
+            }
+        }
+        #[derive(Clone)]
+        struct Replies(Arc<Mutex<Vec<String>>>);
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+
+        let (seen, replies) = (Arc::default(), Arc::default());
+        let mut term =
+            Term::new(Config::default(), &TermSize::new(10, 5), Replies(Arc::clone(&replies)));
+        term.set_graphics(Box::new(Seen(Arc::clone(&seen))));
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"ab\r\nc\x1b_Gi=1,a=q;AAAA\x1b\\d\x1b_xother\x1b\\");
+
+        let cursor = Point::new(Line(1), Column(1));
+        assert_eq!(*seen.lock().unwrap(), [(b"i=1,a=q;AAAA".to_vec(), cursor)]);
+        assert_eq!(*replies.lock().unwrap(), ["\x1b_Gi=1;OK\x1b\\"]);
+        assert_eq!(term.grid()[cursor].c, 'd');
+    }
 
     #[test]
     fn scroll_display_page_up() {
