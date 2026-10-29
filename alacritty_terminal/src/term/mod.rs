@@ -347,41 +347,58 @@ pub trait Graphics: Send {
     fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, columns: usize, lines: usize);
 }
 
-/// Each line's logical line, from the cursor's, and row within.
+/// Each line's logical line, from the oldest, and text cells.
 struct Logical {
     top: i32,
+    columns: usize,
     rows: Vec<(i32, usize)>,
+    /// Logical lines through the last that holds text.
+    text: i32,
 }
 
 impl Logical {
     fn of(grid: &Grid<Cell>, reflow: bool) -> Self {
-        let top = -(grid.history_size() as i32);
-        let last = Column(grid.columns() - 1);
+        let (top, columns) = (-(grid.history_size() as i32), grid.columns());
+        let last = Column(columns - 1);
         let mut rows = Vec::new();
-        let (mut index, mut within) = (0i32, 0usize);
+        let mut index = 0i32;
         for line in top..grid.screen_lines() as i32 {
-            rows.push((index, within));
-            let wraps = reflow && grid[Line(line)][last].flags.contains(Flags::WRAPLINE);
-            (index, within) = if wraps { (index, within + 1) } else { (index + 1, 0) };
+            let flags = grid[Line(line)][last].flags;
+            // A wide character's leading spacer holds no text.
+            let spacer = flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+            rows.push((index, columns - usize::from(spacer)));
+            if !(reflow && flags.contains(Flags::WRAPLINE)) {
+                index += 1;
+            }
         }
-        let cursor = rows[(grid.cursor.point.line.0 - top) as usize].0;
-        rows.iter_mut().for_each(|row| row.0 -= cursor);
-        Self { top, rows }
+        let lines = top..grid.screen_lines() as i32;
+        let texted = lines.rev().find(|&line| !grid[Line(line)].is_clear());
+        let text = texted.map_or(0, |line| rows[(line - top) as usize].0 + 1);
+        Self { top, columns, rows, text }
     }
 
-    /// `point`'s logical line and its offset in it, in `columns`.
-    fn at(&self, point: Point, columns: usize) -> Option<(i32, usize)> {
-        let (index, within) = *self.rows.get(usize::try_from(point.line.0 - self.top).ok()?)?;
-        Some((index, within * columns + point.column.0))
+    /// `point`'s logical line and its offset in text cells.
+    fn at(&self, point: Point) -> Option<(i32, usize)> {
+        let at = usize::try_from(point.line.0 - self.top).ok()?;
+        let index = self.rows.get(at)?.0;
+        let before = self.rows[..at].iter().rev().take_while(|row| row.0 == index);
+        Some((index, before.map(|row| row.1).sum::<usize>() + point.column.0))
     }
 
-    /// The point `offset` into logical line `index`, in `columns`.
-    fn point(&self, (index, offset): (i32, usize), columns: usize) -> Option<Point> {
+    /// The point `offset` text cells into `before`'s line `index`.
+    fn point(&self, before: &Logical, (index, mut offset): (i32, usize)) -> Option<Point> {
+        // A full history drops its oldest lines.
+        let index = index - (before.text - self.text);
         let first = self.rows.partition_point(|row| row.0 < index);
         let rows = self.rows[first..].iter().take_while(|row| row.0 == index).count();
-        let row = cmp::min(offset / columns, rows.checked_sub(1)?);
-        let column = cmp::min(offset - row * columns, columns - 1);
-        Some(Point::new(Line(self.top + (first + row) as i32), Column(column)))
+        for (row, &(_, cells)) in self.rows[first..first + rows].iter().enumerate() {
+            if offset < cells || row + 1 == rows {
+                let column = Column(cmp::min(offset, self.columns - 1));
+                return Some(Point::new(Line(self.top + (first + row) as i32), column));
+            }
+            offset -= cells;
+        }
+        None
     }
 }
 
@@ -761,9 +778,9 @@ impl<T> Term<T> {
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
         if let (Some(graphics), Some(before)) = (self.graphics.as_mut(), before) {
-            // Points follow their logical line, as the cursor does.
+            // Points keep their logical line and their text cells.
             let after = Logical::of(&self.grid, !is_alt);
-            let moved = |point| after.point(before.at(point, old_cols)?, num_cols);
+            let moved = |point| after.point(&before, before.at(point)?);
             graphics.resized(&moved, num_cols, num_lines);
         }
 
@@ -2805,18 +2822,59 @@ mod tests {
             }
         }
 
-        let points = [Point::new(Line(0), Column(6)), Point::new(Line(2), Column(2))];
-        let moved = Moved::new(Mutex::new(points.map(Some).to_vec()));
-        let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
+        // A wide character that no longer fits leaves a spacer.
+        type Case = (&'static str, &'static [(i32, usize)], &'static str);
+        let cases: [Case; 2] =
+            [("abcdefghijklmn\r\nxyz", &[(0, 6), (2, 2)], "gz"), ("abcd\u{754c}X", &[(0, 6)], "X")];
+        for (text, points, chars) in cases {
+            let points =
+                points.iter().map(|&(line, column)| Some(Point::new(Line(line), Column(column))));
+            let moved = Moved::new(Mutex::new(points.collect()));
+            let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
+            term.set_graphics(Box::new(Map(Arc::clone(&moved))));
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            parser.advance(&mut term, text.as_bytes());
+            for size in [TermSize::new(5, 5), TermSize::new(10, 5)] {
+                term.resize(size);
+                let points: Vec<Point> = moved.lock().unwrap().iter().flatten().copied().collect();
+                let seen: String = points.iter().map(|point| term.grid()[*point].c).collect();
+                assert_eq!(seen, chars, "{text:?} {points:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_resized_point_keeps_its_line_when_a_full_history_drops_lines() {
+        use std::sync::Mutex;
+
+        type Moved = Arc<Mutex<Vec<Point>>>;
+        struct Map(Moved);
+        impl Graphics for Map {
+            fn command(&mut self, _: &[u8], _: Point) -> Answer {
+                Answer::default()
+            }
+
+            fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
+
+            fn changed(&mut self, _: Change) {}
+
+            fn resized(&mut self, moved: &dyn Fn(Point) -> Option<Point>, _: usize, _: usize) {
+                let mut points = self.0.lock().unwrap();
+                *points = points.iter().map(|point| moved(*point).expect("kept")).collect();
+            }
+        }
+
+        let points = vec![Point::new(Line(2), Column(0)), Point::new(Line(1), Column(3))];
+        let moved = Moved::new(Mutex::new(points));
+        let config = Config { scrolling_history: 3, ..Config::default() };
+        let mut term = Term::new(config, &TermSize::new(10, 3), VoidListener);
         term.set_graphics(Box::new(Map(Arc::clone(&moved))));
         let mut parser: ansi::Processor = ansi::Processor::new();
-        parser.advance(&mut term, b"abcdefghijklmn\r\nxyz");
-        for size in [TermSize::new(5, 5), TermSize::new(10, 5)] {
-            term.resize(size);
-            let points: Vec<Point> = moved.lock().unwrap().iter().flatten().copied().collect();
-            let chars: String = points.iter().map(|point| term.grid()[*point].c).collect();
-            assert_eq!(chars, "gz", "{points:?}");
-        }
+        parser.advance(&mut term, b"abcdefghi\r\njklmnopqr\r\nstuvwxyz0\r\n123456789\r\nX");
+        term.resize(TermSize::new(5, 3));
+        let seen: String =
+            moved.lock().unwrap().iter().map(|point| term.grid()[*point].c).collect();
+        assert_eq!(seen, "X4");
     }
 
     #[test]
