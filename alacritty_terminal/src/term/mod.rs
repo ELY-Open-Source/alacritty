@@ -2576,7 +2576,8 @@ mod tests {
     fn kitty_graphics_reach_their_handler_at_the_cursor() {
         use std::sync::Mutex;
 
-        struct Seen(Arc<Mutex<Vec<(Vec<u8>, Point)>>>);
+        type Commands = Arc<Mutex<Vec<(Vec<u8>, Point)>>>;
+        struct Seen(Commands);
         impl Graphics for Seen {
             fn command(&mut self, command: &[u8], cursor: Point) -> Option<String> {
                 self.0.lock().unwrap().push((command.to_vec(), cursor));
