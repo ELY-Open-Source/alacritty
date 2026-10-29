@@ -275,6 +275,10 @@ pub struct Term<T> {
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
+    /// Print runs a character at a time, the oracle for the fast path.
+    #[cfg(test)]
+    pub(crate) slow_runs: bool,
+
     /// Cursor for keyboard selection.
     pub vi_mode_cursor: ViModeCursor,
 
@@ -484,6 +488,8 @@ impl<T> Term<T> {
         let damage = TermDamageState::new(num_cols, num_lines);
 
         Term {
+            #[cfg(test)]
+            slow_runs: false,
             inactive_grid,
             scroll_region,
             event_proxy,
@@ -1119,6 +1125,46 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// Printable ASCII written straight into rows, as `input` writes each.
+    fn write_ascii(&mut self, mut bytes: &[u8])
+    where
+        T: EventListener,
+    {
+        let columns = self.columns();
+        while !bytes.is_empty() {
+            if self.grid.cursor.input_needs_wrap {
+                self.wrapline();
+            }
+            let point = self.grid.cursor.point;
+            let count = (columns - point.column.0).min(bytes.len());
+            let end = point.column + count;
+            let template = self.grid.cursor.template.clone();
+            let cells = &mut self.grid[point.line][point.column..end];
+            // A wide character's halves clear as `input` clears them.
+            if cells
+                .iter()
+                .any(|cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER))
+            {
+                bytes[..count].iter().for_each(|&byte| self.input(char::from(byte)));
+            } else {
+                for (cell, &byte) in cells.iter_mut().zip(bytes) {
+                    cell.c = char::from(byte);
+                    cell.fg = template.fg;
+                    cell.bg = template.bg;
+                    cell.flags = template.flags;
+                    cell.extra.clone_from(&template.extra);
+                }
+                if end.0 < columns {
+                    self.grid.cursor.point.column = end;
+                } else {
+                    self.grid.cursor.point.column = Column(columns - 1);
+                    self.grid.cursor.input_needs_wrap = true;
+                }
+            }
+            bytes = &bytes[count..];
+        }
+    }
+
     /// Write `c` to the cell at the cursor position.
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
@@ -1291,6 +1337,31 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.column += 1;
         } else {
             self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    #[inline]
+    fn input_run(&mut self, run: &str) {
+        // A run holds no escape, so neither insert mode nor the charset changes in it.
+        let plain = !self.mode.contains(TermMode::INSERT)
+            && self.grid.cursor.charsets[self.active_charset] == StandardCharset::Ascii;
+        #[cfg(test)]
+        let plain = plain && !self.slow_runs;
+        if !plain {
+            run.chars().for_each(|c| self.input(c));
+            return;
+        }
+        let mut rest = run;
+        while !rest.is_empty() {
+            let ascii = rest.bytes().take_while(|byte| (0x20..0x7f).contains(byte)).count();
+            if ascii > 0 {
+                self.write_ascii(&rest.as_bytes()[..ascii]);
+                rest = &rest[ascii..];
+            } else {
+                let c = rest.chars().next().expect("the run goes on");
+                self.input(c);
+                rest = &rest[c.len_utf8()..];
+            }
         }
     }
 
@@ -2772,6 +2843,67 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [(b"i=1,a=q;AAAA".to_vec(), cursor)]);
         assert_eq!(*replies.lock().unwrap(), ["\x1b_Gi=1;OK\x1b\\"]);
         assert_eq!(term.grid()[cursor].c, 'd');
+    }
+
+    #[test]
+    fn printable_runs_write_as_each_character_would() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (columns, lines) = (20, 8);
+        for stream in 0..400 {
+            let mut text = String::new();
+            for _ in 0..120 {
+                let token = match next(16) {
+                    0..=4 => (0..1 + next(70)).map(|_| char::from(b' ' + next(95) as u8)).collect(),
+                    5 => ["\r\n", "\n", "\r", "\t", "\x08"][next(5)].to_string(),
+                    6 => ["中文字", "e\u{301}", "😀", "ab中"][next(4)].to_string(),
+                    7 => ["\x1b[31m", "\x1b[0m", "\x1b[7;44m", "\x1b[4:3m"][next(4)].to_string(),
+                    8 => format!("\x1b[{};{}H", 1 + next(lines), 1 + next(columns + 2)),
+                    9 => ["\x1b[4h", "\x1b[4l"][next(2)].to_string(),
+                    10 => ["\x1b[?7l", "\x1b[?7h"][next(2)].to_string(),
+                    11 => ["\x1b(0", "\x1b(B", "\x1b)0\x0e", "\x0f"][next(4)].to_string(),
+                    12 => {
+                        ["\x1b[K", "\x1b[1K", "\x1b[2J", "\x1b[3P", "\x1b[2@"][next(5)].to_string()
+                    },
+                    13 => format!("\x1b[{}b", 1 + next(30)),
+                    14 => format!("\x1b]8;id={stream};x://{stream}\x1b\\{}\x1b]8;;\x1b\\", "ln"),
+                    _ => "\x1b7\x1b[2;5r\x1b[5;1H\n\x1b[r\x1b8".to_string(),
+                };
+                text.push_str(&token);
+            }
+            let config = Config { scrolling_history: 50, ..Config::default() };
+            let size = TermSize::new(columns, lines);
+            let mut fast = Term::new(config.clone(), &size, VoidListener);
+            let mut slow = Term::new(config, &size, VoidListener);
+            slow.slow_runs = true;
+            let mut parsers: (ansi::Processor, ansi::Processor) = Default::default();
+            let mut rest = text.as_bytes();
+            while !rest.is_empty() {
+                let take = (1 + next(40)).min(rest.len());
+                parsers.0.advance(&mut fast, &rest[..take]);
+                parsers.1.advance(&mut slow, &rest[..take]);
+                rest = &rest[take..];
+            }
+            let grid = |term: &Term<VoidListener>| {
+                let grid = term.grid();
+                let rows = grid.topmost_line().0..=grid.bottommost_line().0;
+                rows.map(|line| {
+                    let row = &grid[Line(line)];
+                    (row[..].to_vec(), row.occ)
+                })
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(grid(&fast), grid(&slow), "stream {stream}: {text:?}");
+            let cursor = |term: &Term<VoidListener>| {
+                (term.grid().cursor.point, term.grid().cursor.input_needs_wrap)
+            };
+            assert_eq!(cursor(&fast), cursor(&slow), "stream {stream}");
+        }
     }
 
     #[test]
