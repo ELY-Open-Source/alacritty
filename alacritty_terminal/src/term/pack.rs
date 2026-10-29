@@ -72,7 +72,8 @@ pub fn pack(row: &Row<Cell>) -> Box<dyn PackedRow<Cell>> {
 impl PackedRow<Cell> for Packed {
     fn unpack(&self) -> Row<Cell> {
         let mut chars = self.text.chars();
-        let mut cells = Vec::with_capacity(self.text.len() + self.tail_len);
+        let body: usize = self.runs.iter().map(|run| run.len).sum();
+        let mut cells = Vec::with_capacity(body + self.tail_len);
         for run in &self.runs {
             for _ in 0..run.len {
                 let c = chars.next().expect("a packed row's text covers its runs");
@@ -117,6 +118,8 @@ mod tests {
         let back = packed.unpack();
         assert_eq!(back, row);
         assert_eq!(back.occ, row.occ);
+        // Its cells, not its text's bytes, size it.
+        assert_eq!(back.capacity(), 12);
         for column in 0..12 {
             match (&back[Column(column)].extra, &row[Column(column)].extra) {
                 (Some(a), Some(b)) => assert!(Arc::ptr_eq(a, b), "column {column}"),

@@ -118,6 +118,12 @@ impl<T> Row<T> {
     }
 
     #[inline]
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
