@@ -1881,7 +1881,12 @@ impl<T: EventListener> Handler for Term<T> {
                 } else {
                     let old_offset = self.grid.display_offset();
 
-                    self.grid.clear_viewport();
+                    let scrolled = self.grid.clear_viewport();
+                    let oldest = Line(-(self.history_size() as i32));
+                    if let Some(graphics) = self.graphics.as_mut().filter(|_| scrolled > 0) {
+                        let region = Line(0)..Line(screen_lines as i32);
+                        graphics.scrolled(&region, scrolled as i32, oldest);
+                    }
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -2705,7 +2710,8 @@ mod tests {
         // The cursor on the last line takes two lines along.
         parser.advance(&mut term, b"\x1b[5;1H");
         term.resize(TermSize::new(10, 3));
-        parser.advance(&mut term, b"\x1b[2J\x1b[3J\x1b[?1049h\x1b[?1049l\x1bc");
+        // ED 2 scrolls the line holding text into history.
+        parser.advance(&mut term, b"\x1b[1;1Hab\x1b[2J\x1b[3J\x1b[?1049h\x1b[?1049l\x1bc");
         assert_eq!(
             *heard.lock().unwrap(),
             [
