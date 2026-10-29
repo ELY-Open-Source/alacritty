@@ -306,7 +306,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
     }
 
-    /// Scrolls the screen's text into history; returns the lines it scrolled.
+    /// Scrolls the screen's text into history; returns how far.
     pub fn clear_viewport<D>(&mut self) -> usize
     where
         T: ResetDiscriminant<D>,

@@ -2721,6 +2721,7 @@ mod tests {
                 "scroll Line(0)..Line(5) -1 -2",
                 "Resized { lines: -2, columns: 10, screen_lines: 3 }",
                 "Screen",
+                "scroll Line(0)..Line(3) 1 -5",
                 "History",
                 "Alt(true)",
                 "Alt(false)",
