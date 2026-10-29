@@ -334,8 +334,37 @@ pub struct Term<T> {
 
 /// Kitty graphics commands, handled by the embedder at the cursor.
 pub trait Graphics: Send {
-    /// One command's text after its `G`; returns its reply.
-    fn command(&mut self, command: &[u8], cursor: Point) -> Option<String>;
+    /// One command's text after its `G`: its reply and cursor.
+    fn command(&mut self, command: &[u8], cursor: Point) -> Answer;
+
+    /// Lines in `region` moved up by `lines`, down when negative.
+    fn scrolled(&mut self, region: &Range<Line>, lines: i32, oldest: Line);
+
+    /// A clear, a reset, a screen swap or a resize.
+    fn changed(&mut self, change: Change);
+}
+
+/// What a graphics command answers, and where the cursor goes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub reply: Option<String>,
+    /// Linefeeds, then the column, as kitty moves past an image.
+    pub cursor: Option<(usize, Column)>,
+}
+
+/// What happened to the screens, as graphics hear it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The screen is about to clear.
+    Screen,
+    /// The history is about to clear.
+    History,
+    /// A full reset, before it runs.
+    Reset,
+    /// The alternate screen is entered, or left.
+    Alt(bool),
+    /// Lines moved by `lines`, as the vi cursor moves.
+    Resized { lines: i32, columns: usize, screen_lines: usize },
 }
 
 /// Configuration options for the [`Term`].
@@ -689,6 +718,10 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        if let Some(graphics) = self.graphics.as_mut() {
+            let (lines, columns, screen_lines) = (delta, num_cols, num_lines);
+            graphics.changed(Change::Resized { lines, columns, screen_lines });
+        }
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
 
@@ -727,6 +760,10 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
+        let entering = !self.mode.contains(TermMode::ALT_SCREEN);
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.changed(Change::Alt(entering));
+        }
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
@@ -774,6 +811,10 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        let oldest = Line(-(self.history_size() as i32));
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.scrolled(&region, -(lines as i32), oldest);
+        }
         self.mark_fully_damaged();
     }
 
@@ -793,6 +834,10 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        let oldest = Line(-(self.history_size() as i32));
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.scrolled(&region, lines as i32, oldest);
+        }
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1828,6 +1873,9 @@ impl<T: EventListener> Handler for Term<T> {
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
             },
             ansi::ClearMode::All => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.changed(Change::Screen);
+                }
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.grid.reset_region(..);
                 } else {
@@ -1845,6 +1893,9 @@ impl<T: EventListener> Handler for Term<T> {
                 self.selection = None;
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.changed(Change::History);
+                }
                 self.grid.clear_history();
 
                 self.vi_mode_cursor.point.line =
@@ -1875,6 +1926,9 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.changed(Change::Reset);
+        }
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -1919,8 +1973,17 @@ impl<T: EventListener> Handler for Term<T> {
             debug!("[unhandled apc] {:?}", String::from_utf8_lossy(&data[..data.len().min(64)]));
             return;
         };
-        if let Some(reply) = graphics.command(command, self.grid.cursor.point) {
+        let answer = graphics.command(command, self.grid.cursor.point);
+        if let Some(reply) = answer.reply {
             self.event_proxy.send_event(Event::PtyWrite(reply));
+        }
+        if let Some((lines, column)) = answer.cursor {
+            for _ in 0..lines {
+                self.linefeed();
+            }
+            self.grid.cursor.input_needs_wrap = false;
+            self.grid.cursor.point.column = cmp::min(column, self.last_column());
+            self.damage_cursor();
         }
     }
 
@@ -2579,10 +2642,14 @@ mod tests {
         type Commands = Arc<Mutex<Vec<(Vec<u8>, Point)>>>;
         struct Seen(Commands);
         impl Graphics for Seen {
-            fn command(&mut self, command: &[u8], cursor: Point) -> Option<String> {
+            fn command(&mut self, command: &[u8], cursor: Point) -> Answer {
                 self.0.lock().unwrap().push((command.to_vec(), cursor));
-                Some("\x1b_Gi=1;OK\x1b\\".into())
+                Answer { reply: Some("\x1b_Gi=1;OK\x1b\\".into()), cursor: None }
             }
+
+            fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
+
+            fn changed(&mut self, _: Change) {}
         }
         #[derive(Clone)]
         struct Replies(Arc<Mutex<Vec<String>>>);
@@ -2605,6 +2672,55 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [(b"i=1,a=q;AAAA".to_vec(), cursor)]);
         assert_eq!(*replies.lock().unwrap(), ["\x1b_Gi=1;OK\x1b\\"]);
         assert_eq!(term.grid()[cursor].c, 'd');
+    }
+
+    #[test]
+    fn graphics_hear_scrolls_clears_swaps_resets_and_resizes() {
+        use std::sync::Mutex;
+
+        type Heard = Arc<Mutex<Vec<String>>>;
+        struct Ear(Heard);
+        impl Graphics for Ear {
+            fn command(&mut self, _: &[u8], _: Point) -> Answer {
+                Answer { reply: None, cursor: Some((2, Column(3))) }
+            }
+
+            fn scrolled(&mut self, region: &Range<Line>, lines: i32, oldest: Line) {
+                self.0.lock().unwrap().push(format!("scroll {region:?} {lines} {}", oldest.0));
+            }
+
+            fn changed(&mut self, change: Change) {
+                self.0.lock().unwrap().push(format!("{change:?}"));
+            }
+        }
+
+        let heard = Heard::default();
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
+        term.set_graphics(Box::new(Ear(Arc::clone(&heard))));
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        // A placement on the last line moves the cursor.
+        parser.advance(&mut term, b"\x1b[5;1H\x1b_Ga=p,i=1\x1b\\");
+        assert_eq!(term.grid.cursor.point, Point::new(Line(4), Column(3)));
+        parser.advance(&mut term, b"\x1b[2;4r\x1b[4;1H\n\x1b[r\x1b[1;1H\x1bM");
+        // The cursor on the last line takes two lines along.
+        parser.advance(&mut term, b"\x1b[5;1H");
+        term.resize(TermSize::new(10, 3));
+        parser.advance(&mut term, b"\x1b[2J\x1b[3J\x1b[?1049h\x1b[?1049l\x1bc");
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [
+                "scroll Line(0)..Line(5) 1 -1",
+                "scroll Line(0)..Line(5) 1 -2",
+                "scroll Line(1)..Line(4) 1 -2",
+                "scroll Line(0)..Line(5) -1 -2",
+                "Resized { lines: -2, columns: 10, screen_lines: 3 }",
+                "Screen",
+                "History",
+                "Alt(true)",
+                "Alt(false)",
+                "Reset",
+            ]
+        );
     }
 
     #[test]
