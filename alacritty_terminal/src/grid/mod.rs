@@ -437,14 +437,12 @@ impl<T> Grid<T> {
         self.display_offset
     }
 
-    /// Pack the history more than a screen above the view, while idle.
-    pub fn compact(&mut self, packer: Packer<T>) {
+    /// Pack the history more than a screen above the view; rows changed.
+    pub fn compact(&mut self, packer: Packer<T>) -> usize {
         let screen = self.screen_lines() as i32;
         let keep = Line(-(self.display_offset as i32) - screen);
         let top = self.topmost_line();
-        if top < keep {
-            self.raw.compact(top..keep, packer);
-        }
+        if top < keep { self.raw.compact(top..keep, packer) } else { 0 }
     }
 
     #[inline]

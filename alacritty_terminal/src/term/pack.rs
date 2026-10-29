@@ -180,9 +180,10 @@ mod tests {
         use crate::grid::Dimensions;
         assert_eq!(packed.grid().history_size(), 200, "history to pack");
         packed.compact();
+        assert_eq!(packed.compact(), 0, "packed already, nothing read");
         // Reading unpacks; the next compaction packs again.
         assert_eq!(lines(&plain), lines(&packed));
-        packed.compact();
+        assert!(packed.compact() > 0, "the reads' copies go");
         plain.resize(TermSize::new(13, 9));
         packed.resize(TermSize::new(13, 9));
         assert_eq!(lines(&plain), lines(&packed), "after a resize");

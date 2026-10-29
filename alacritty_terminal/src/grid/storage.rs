@@ -189,12 +189,14 @@ impl<T> Storage<T> {
         buffer.into_iter().map(Slot::into_row).collect()
     }
 
-    /// Pack `lines`, which are idle history, or drop their unpacked copies.
-    pub fn compact(&mut self, lines: std::ops::Range<Line>, packer: Packer<T>) {
+    /// Pack `lines`, idle history, or drop unpacked copies; how many changed.
+    pub fn compact(&mut self, lines: std::ops::Range<Line>, packer: Packer<T>) -> usize {
+        let mut packed = 0;
         for line in lines.start.0..lines.end.0 {
             let index = self.compute_index(Line(line));
-            self.inner[index].pack(packer);
+            packed += usize::from(self.inner[index].pack(packer));
         }
+        packed
     }
 
     /// Compute actual index in underlying storage given the requested index.

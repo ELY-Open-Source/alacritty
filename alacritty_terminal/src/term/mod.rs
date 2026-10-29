@@ -439,10 +439,11 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
-    /// Pack idle history in both screens' grids; reading it unpacks it again.
-    pub fn compact(&mut self) {
-        self.grid.compact(pack::pack);
-        self.inactive_grid.compact(pack::pack);
+    /// Pack idle history in both screens' grids; the rows it changed.
+    ///
+    /// Reading a packed row unpacks it again until the next pass.
+    pub fn compact(&mut self) -> usize {
+        self.grid.compact(pack::pack) + self.inactive_grid.compact(pack::pack)
     }
 
     #[inline]

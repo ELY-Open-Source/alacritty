@@ -51,11 +51,14 @@ impl<T> Slot<T> {
         }
     }
 
-    /// Packs a whole row; a packed one drops its unpacked copy.
-    pub fn pack(&mut self, packer: Packer<T>) {
+    /// Packs a whole row, or drops a packed one's copy; whether it did.
+    pub fn pack(&mut self, packer: Packer<T>) -> bool {
         match self {
-            Slot::Row(row) => *self = Slot::Packed(packer(row), OnceLock::new()),
-            Slot::Packed(_, row) => drop(row.take()),
+            Slot::Row(row) => {
+                *self = Slot::Packed(packer(row), OnceLock::new());
+                true
+            },
+            Slot::Packed(_, row) => row.take().is_some(),
         }
     }
 }
