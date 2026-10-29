@@ -353,6 +353,9 @@ pub trait Graphics: Send {
 /// The link marking an anchor's cell through a resize.
 const ANCHOR: &str = "\u{7f}graphics";
 
+/// A marked cell, its own link, and the mark.
+type Mark = (Point, Option<cell::Hyperlink>, cell::Hyperlink);
+
 /// What a graphics command answers, and where the cursor goes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -763,9 +766,9 @@ impl<T> Term<T> {
     }
 
     /// Marks anchors' cells and their rows' first; returns old links.
-    fn mark(&mut self, anchors: &[Point]) -> Vec<(Point, Option<cell::Hyperlink>)> {
+    fn mark(&mut self, anchors: &[Point]) -> Vec<Mark> {
         let (top, bottom) = (-(self.history_size() as i32), self.screen_lines() as i32);
-        let mut marks: Vec<(Point, Option<cell::Hyperlink>)> = Vec::new();
+        let mut marks: Vec<Mark> = Vec::new();
         for &anchor in anchors {
             for point in [anchor, Point::new(anchor.line, Column(0))] {
                 let inside =
@@ -774,30 +777,27 @@ impl<T> Term<T> {
                     continue;
                 }
                 let cell = &mut self.grid[point];
-                marks.push((point, cell.hyperlink()));
-                cell.set_hyperlink(Some(cell::Hyperlink::new(
-                    Some(marks.len() - 1),
-                    ANCHOR.into(),
-                )));
+                let link = cell::Hyperlink::new(Some(marks.len()), ANCHOR.into());
+                marks.push((point, cell.hyperlink(), link.clone()));
+                cell.set_hyperlink(Some(link));
             }
         }
         marks
     }
 
     /// Clears the marks; each anchor's cell, else its row's, moved.
-    fn unmark(
-        &mut self,
-        anchors: &[Point],
-        marks: Vec<(Point, Option<cell::Hyperlink>)>,
-    ) -> Vec<Option<Point>> {
+    fn unmark(&mut self, anchors: &[Point], marks: Vec<Mark>) -> Vec<Option<Point>> {
         let mut found = vec![None; marks.len()];
         if !marks.is_empty() {
             for line in -(self.history_size() as i32)..self.screen_lines() as i32 {
                 for column in 0..self.columns() {
                     let point = Point::new(Line(line), Column(column));
                     let cell = &mut self.grid[point];
+                    // Only links made here; a program may print one alike.
                     let link = cell.hyperlink().filter(|link| link.uri() == ANCHOR);
-                    let Some(index) = link.and_then(|link| link.id().parse::<usize>().ok()) else {
+                    let mine =
+                        |link: &cell::Hyperlink| marks.iter().position(|mark| mark.2.same(link));
+                    let Some(index) = link.as_ref().and_then(mine) else {
                         continue;
                     };
                     cell.set_hyperlink(marks[index].1.clone());
@@ -2873,6 +2873,40 @@ mod tests {
                 assert!(!marked, "the marks are gone");
             }
         }
+    }
+
+    #[test]
+    fn a_program_s_link_like_a_mark_stays_a_link() {
+        struct One;
+        impl Graphics for One {
+            fn command(&mut self, _: &[u8], _: Point) -> Answer {
+                Answer::default()
+            }
+
+            fn scrolled(&mut self, _: &Range<Line>, _: i32, _: Line) {}
+
+            fn changed(&mut self, _: Change) {}
+
+            fn anchors(&self) -> Vec<Point> {
+                vec![Point::new(Line(0), Column(1))]
+            }
+
+            fn resized(&mut self, moved: &[Option<Point>], _: usize, _: usize) {
+                assert_eq!(moved, [Some(Point::new(Line(0), Column(1)))]);
+            }
+        }
+
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 5), VoidListener);
+        term.set_graphics(Box::new(One));
+        let forged = Hyperlink { id: Some("5".into()), uri: ANCHOR.into() };
+        term.input('a');
+        term.input('b');
+        term.set_hyperlink(Some(forged));
+        term.input('Z');
+        term.set_hyperlink(None);
+        term.resize(TermSize::new(5, 5));
+        let link = term.grid()[Point::new(Line(0), Column(2))].hyperlink().expect("its link");
+        assert_eq!((link.id(), link.uri()), ("5", ANCHOR));
     }
 
     #[test]

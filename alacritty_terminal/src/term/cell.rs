@@ -58,6 +58,11 @@ impl Hyperlink {
     pub fn uri(&self) -> &str {
         &self.inner.uri
     }
+
+    /// Whether both are the one link made, not merely alike.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl From<VteHyperlink> for Hyperlink {
