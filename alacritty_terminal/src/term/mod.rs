@@ -2547,6 +2547,13 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
+        })));
+    }
+
+    #[inline]
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
@@ -2799,6 +2806,31 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn the_pixel_size_reports_answer_in_the_window_s_cells() {
+        use crate::event::WindowSize;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Asks(Arc<Mutex<Vec<String>>>);
+        impl EventListener for Asks {
+            fn send_event(&self, event: Event) {
+                if let Event::TextAreaSizeRequest(reply) = event {
+                    let size =
+                        WindowSize { num_lines: 5, num_cols: 10, cell_width: 9, cell_height: 21 };
+                    self.0.lock().unwrap().push(reply(size));
+                }
+            }
+        }
+
+        let replies = Arc::default();
+        let mut term =
+            Term::new(Config::default(), &TermSize::new(10, 5), Asks(Arc::clone(&replies)));
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[14t\x1b[16t");
+        assert_eq!(*replies.lock().unwrap(), ["\x1b[4;105;90t", "\x1b[6;21;9t"]);
+    }
 
     #[test]
     fn kitty_graphics_reach_their_handler_at_the_cursor() {

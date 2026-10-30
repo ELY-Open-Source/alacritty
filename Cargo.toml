@@ -21,4 +21,4 @@ toml = "0.9.11"
 toml_edit = "0.24.0"
 
 [patch.crates-io]
-vte = { git = "https://github.com/ELY-Open-Source/vte.git", rev = "5142c08caf49148ece94d4ce418e54da8b9eab90" }
+vte = { git = "https://github.com/ELY-Open-Source/vte.git", rev = "8fa83a9b51cadcad3269e1ef3ab059672d875983" }
